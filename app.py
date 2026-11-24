@@ -1,212 +1,204 @@
 from pathlib import Path
-from datetime import datetime, timezone
+import sys
 import pandas as pd
+import numpy as np
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 
-from modules.data_processing import read_csv_bytes, validate_dataset, prepare_analysis_copy, MODEL_FEATURES
-from modules.exploratory_analysis import service_volume_chart, target_chart, office_breach_chart, queue_chart
-from modules.dashboard import dashboard_kpis, review_queue
-from modules.prediction import load_model, predict_one, MODEL_PATH
+ROOT = Path(__file__).parent
+sys.path.insert(0, str(ROOT))
+from utils.data_processing import load_and_clean_data, apply_filters, make_recommendation
+from utils.modeling import train_risk_models, run_student_clustering
+from utils.reports import build_pdf_report
 
-BASE = Path(__file__).resolve().parent
-st.set_page_config(page_title="Student Service Request Monitoring System", page_icon="📊", layout="wide")
-st.title("Student Service Request Monitoring System")
-st.caption("Section B · BS Information Systems · Advisory decision support")
+st.set_page_config(page_title="Student Performance | Academic Support", page_icon="🎓", layout="wide")
+
+st.markdown("""
+<style>
+:root { --navy:#172554; --blue:#2563eb; --purple:#7c3aed; }
+[data-testid="stAppViewContainer"] {background:linear-gradient(135deg,#f7f8ff 0%,#f4f5fb 55%,#f8f7ff 100%);}
+[data-testid="stSidebar"] {background:linear-gradient(180deg,#172554,#312e81); }
+[data-testid="stSidebar"] * {color:#fff !important;}
+.block-container {padding-top:1.6rem; padding-bottom:2rem; max-width:1500px;}
+.hero {background:linear-gradient(110deg,#1d4ed8,#6d28d9);padding:25px 28px;border-radius:18px;color:white;margin-bottom:18px;box-shadow:0 10px 28px #1e3a8a22;}
+.hero h1 {font-size:30px; margin:0 0 5px 0; color:white;}
+.hero p {margin:0;color:#e0e7ff;}
+.kpi {background:white;border:1px solid #e5e7eb;border-radius:15px;padding:17px 18px;box-shadow:0 4px 15px #1e293b0b;min-height:112px;}
+.kpi-label {font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:.07em;}
+.kpi-value {font-size:27px;font-weight:800;color:#172554;margin-top:7px;}
+.kpi-note {font-size:12px;color:#64748b;margin-top:3px;}
+.section-title {font-size:20px;font-weight:800;color:#172554;margin:18px 0 8px;}
+.small-note {font-size:12px;color:#64748b;}
+div[data-testid="stMetric"] {background:white;padding:14px;border-radius:14px;border:1px solid #e5e7eb;}
+</style>
+""", unsafe_allow_html=True)
 
 @st.cache_data
-def load_example_data(path: str):
-    return pd.read_csv(path)
-
 def get_data():
-    uploaded = st.session_state.get("uploaded_bytes")
-    if uploaded:
-        try: return read_csv_bytes(uploaded)
-        except ValueError as e:
-            st.error(str(e))
-            return pd.DataFrame()
-    try: return load_example_data(str(BASE / "data" / "sample_data.csv"))
-    except Exception: return pd.DataFrame()
+    return load_and_clean_data(ROOT / "data" / "student_performance.csv")
 
-menu = st.sidebar.selectbox("Navigate", ["Home", "Dataset", "Data Analysis", "Prediction", "Dashboard", "System Design"])
-st.sidebar.caption("Use synthetic or authorized data only.")
-upload = st.sidebar.file_uploader("Optional CSV for this session", type=["csv"])
-if upload is not None:
-    st.session_state["uploaded_bytes"] = upload.getvalue()
-elif "uploaded_bytes" not in st.session_state:
-    st.session_state["uploaded_bytes"] = None
-df_raw = get_data()
-df = prepare_analysis_copy(df_raw) if not df_raw.empty else df_raw
+df, cleaning = get_data()
 
-if menu == "Home":
-    st.header("Welcome")
-    st.write("This application supports student-services staff by exploring service-request data, estimating potential SLA breach risk using the original fitted model when supplied, and prioritizing human review.")
+with st.sidebar:
+    st.markdown("## 🎓 Academic Insight")
+    st.caption("Student Performance Monitoring System")
+    page = st.radio("NAVIGATION", ["Overview", "Performance Analysis", "Risk & Priority List", "Machine Learning", "Student Clustering", "Reports"])
+    st.divider()
+    st.markdown("### FILTERS")
+    years = st.multiselect("School year", sorted(df.school_year.dropna().unique()), default=sorted(df.school_year.dropna().unique()))
+    levels = st.multiselect("Year level", sorted(df.year_level.dropna().unique()), default=sorted(df.year_level.dropna().unique()))
+    sections = st.multiselect("Section", sorted(df.section.dropna().unique()), default=sorted(df.section.dropna().unique()))
+    risks = st.multiselect("Risk level", ["Low", "Moderate", "High"], default=["Low", "Moderate", "High"])
+    st.caption("Subject filter is available on Performance Analysis.")
+    st.divider()
+    st.markdown("**DEMO DATA NOTICE**")
+    st.caption("This application uses synthetic sample records. It is not connected to an actual school database.")
+
+filtered = apply_filters(df, years, levels, sections, risks)
+
+def header(title, subtitle):
+    st.markdown(f'<div class="hero"><h1>{title}</h1><p>{subtitle}</p></div>', unsafe_allow_html=True)
+
+def kpi(label, value, note=""):
+    st.markdown(f'<div class="kpi"><div class="kpi-label">{label}</div><div class="kpi-value">{value}</div><div class="kpi-note">{note}</div></div>', unsafe_allow_html=True)
+
+if filtered.empty:
+    st.warning("No student records match the selected filters. Please change the filters in the sidebar.")
+    st.stop()
+
+if page == "Overview":
+    header("Student Performance Overview", "A decision-support view of academic performance, attendance, and student support needs.")
+    a,b,c,d = st.columns(4)
+    with a: kpi("Total students", f"{len(filtered):,}", "Students in current filter")
+    with b: kpi("Average general grade", f"{filtered.general_average.mean():.1f}", "Current general average")
+    with c: kpi("Average attendance", f"{filtered.attendance_rate.mean():.1f}%", "Current attendance rate")
+    with d: kpi("High-risk students", f"{(filtered.risk_level=='High').sum():,}", "Requires priority review")
+    st.markdown('<div class="section-title">Academic risk distribution</div>', unsafe_allow_html=True)
+    c1,c2 = st.columns([1,1.35])
+    with c1:
+        counts = filtered.risk_level.value_counts().reindex(["Low","Moderate","High"], fill_value=0).rename_axis("Risk level").reset_index(name="Students")
+        fig = px.pie(counts, names="Risk level", values="Students", hole=.58, color="Risk level",
+                     color_discrete_map={"Low":"#16a34a","Moderate":"#f59e0b","High":"#dc2626"})
+        fig.update_layout(margin=dict(t=20,b=20,l=10,r=10), legend_title="")
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        by_level = filtered.groupby("year_level", as_index=False).agg(Students=("student_code","count"), Average_Grade=("general_average","mean"))
+        fig = px.bar(by_level, x="year_level", y="Average_Grade", color="year_level", text_auto=".1f",
+                     labels={"year_level":"Year level","Average_Grade":"Average grade"}, title="Average grade by year level")
+        fig.update_layout(showlegend=False, yaxis_range=[0,100], margin=dict(t=50,b=20))
+        st.plotly_chart(fig, use_container_width=True)
+    st.markdown('<div class="section-title">Students needing attention</div>', unsafe_allow_html=True)
+    priority = filtered[filtered.risk_level.isin(["High","Moderate"])].copy()
+    priority["recommended_action"] = priority.apply(make_recommendation, axis=1)
+    st.dataframe(priority[["student_code","year_level","section","general_average","attendance_rate","failed_subjects","risk_level","recommended_action"]].sort_values(["risk_level","general_average"], ascending=[False,True]).head(12), use_container_width=True, hide_index=True)
+    st.caption(f"Data cleaning: {cleaning['missing_values_filled']} missing values filled; {cleaning['duplicate_rows_removed']} duplicate rows removed.")
+
+elif page == "Performance Analysis":
+    header("Performance Analysis", "Compare subject grades, attendance patterns, and failed-subject counts.")
+    subject = st.selectbox("Choose subject", ["All subjects","Math","English","Science"])
+    grade_cols = {"Math":"math_grade","English":"english_grade","Science":"science_grade"}
+    if subject == "All subjects":
+        long = filtered.melt(id_vars=["student_code","year_level","section"], value_vars=list(grade_cols.values()), var_name="Subject", value_name="Grade")
+        long["Subject"] = long["Subject"].str.replace("_grade","",regex=False).str.title()
+    else:
+        long = filtered[["student_code","year_level","section",grade_cols[subject]]].rename(columns={grade_cols[subject]:"Grade"})
+        long["Subject"] = subject
+    c1,c2 = st.columns(2)
+    with c1:
+        fig = px.box(long, x="Subject", y="Grade", color="Subject", points="outliers", title="Grade distribution by subject")
+        fig.update_layout(yaxis_range=[0,100], showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        att = px.histogram(filtered, x="attendance_rate", nbins=18, color="risk_level", barmode="overlay",
+                           title="Attendance distribution", labels={"attendance_rate":"Attendance rate (%)","risk_level":"Risk"})
+        st.plotly_chart(att, use_container_width=True)
+    failed = filtered.groupby("year_level", as_index=False)["failed_subjects"].sum()
+    fig = px.bar(failed, x="year_level", y="failed_subjects", color="year_level", title="Total failed subjects by year level",
+                 labels={"year_level":"Year level","failed_subjects":"Failed subjects"})
+    st.plotly_chart(fig, use_container_width=True)
+    st.markdown("#### Subject summary")
+    st.dataframe(long.groupby("Subject")["Grade"].agg(["count","mean","median","min","max"]).round(2), use_container_width=True)
+
+elif page == "Risk & Priority List":
+    header("Risk Analysis & Priority Support", "Review students by academic risk and use suggested interventions as a starting point for staff review.")
+    risk_counts = filtered.risk_level.value_counts().reindex(["Low","Moderate","High"],fill_value=0)
     c1,c2,c3 = st.columns(3)
-    c1.metric("Dataset rows", f"{len(df):,}")
-    c2.metric("Dataset columns", f"{len(df.columns):,}")
-    c3.metric("Saved model available", "Yes" if MODEL_PATH.exists() else "No")
-    st.subheader("Available modules")
-    st.markdown("- **Dataset:** upload, validate, and inspect CSV files.\n- **Data Analysis:** explore request volume and observed outcomes.\n- **Prediction:** use the saved fitted pipeline when it is provided.\n- **Dashboard:** review operational KPIs and request queue.\n- **System Design:** requirements, actors, use case, and workflow.")
-    st.warning("Predictions are advisory only. Staff must verify the request and make the final decision. The current package does not include a saved fitted model artifact, so model-based predictions remain disabled until the original pipeline is supplied.")
-    st.caption("Access limitation: authentication and role-based access control are not implemented in this prototype. Do not expose confidential records publicly.")
+    with c1: kpi("Low risk", int(risk_counts["Low"]), "Continue regular monitoring")
+    with c2: kpi("Moderate risk", int(risk_counts["Moderate"]), "Follow-up and academic advising")
+    with c3: kpi("High risk", int(risk_counts["High"]), "Priority staff assessment")
+    priority = filtered.copy()
+    priority["recommended_action"] = priority.apply(make_recommendation, axis=1)
+    priority = priority[priority.risk_level.isin(["High","Moderate"])].sort_values(["risk_level","general_average"], ascending=[True,True])
+    search = st.text_input("Search student code", placeholder="e.g. STU-0001")
+    if search:
+        priority = priority[priority.student_code.str.contains(search, case=False, na=False)]
+    st.dataframe(priority[["student_code","school_year","year_level","section","general_average","attendance_rate","failed_subjects","risk_level","recommended_action"]], use_container_width=True, hide_index=True)
+    st.info("Risk categories are demonstration labels generated for this synthetic dataset. Recommendations are decision-support suggestions, not automatic decisions about students.")
 
-elif menu == "Dataset":
-    st.header("Dataset Upload and Validation")
-    st.info("Upload a CSV in the sidebar. Without an upload, the included midterm cleaned dataset is shown.")
-    if df_raw.empty:
-        st.error("No readable data is available.")
+elif page == "Machine Learning":
+    header("Predictive Modeling", "Train and evaluate Decision Tree and Random Forest models using prior-period information.")
+    st.markdown("The target is current `risk_level`. Model inputs are prior-period grades, attendance, and failed subjects. Current grades and current attendance are excluded from predictors to reduce target leakage.")
+    with st.spinner("Training and evaluating models..."):
+        results = train_risk_models(df)
+    if "error" in results:
+        st.error(results["error"])
     else:
-        validation = validate_dataset(df_raw)
-        st.write(f"Rows: **{len(df_raw):,}** · Columns: **{len(df_raw.columns):,}")
-        st.subheader("Data preview")
-        safe_preview = df_raw.head(20).copy()
-        # Mask identifier values in the preview to avoid unnecessary exposure.
-        if "Request_ID" in safe_preview: safe_preview["Request_ID"] = safe_preview["Request_ID"].astype(str).map(lambda _: "••••")
-        st.dataframe(safe_preview, use_container_width=True)
-        st.subheader("Validation")
-        if validation["valid_schema"]: st.success("All expected midterm dataset columns are present.")
-        else: st.error("Missing expected columns: " + ", ".join(validation["missing_columns"]))
-        if validation["numeric_type_issues"]: st.warning("Values that cannot be parsed as numbers: " + str(validation["numeric_type_issues"]))
-        c1,c2,c3 = st.columns(3)
-        c1.metric("Missing cells", sum(validation["missing_values"].values()))
-        c2.metric("Duplicate rows", validation["duplicate_rows"])
-        c3.metric("Duplicate Request_ID", validation["duplicate_request_ids"] if validation["duplicate_request_ids"] is not None else "Column absent")
-        with st.expander("Missing values by column"):
-            st.dataframe(pd.DataFrame({"Column":list(validation["missing_values"]), "Missing":list(validation["missing_values"].values())}), use_container_width=True)
-        with st.expander("Descriptive statistics"):
-            st.dataframe(df_raw.describe(include="all").transpose(), use_container_width=True)
-        st.download_button("Download current dataset CSV", df_raw.to_csv(index=False).encode("utf-8"), "validated_dataset_copy.csv", "text/csv")
+        c1,c2 = st.columns(2)
+        for col, name in [(c1,"Decision Tree"),(c2,"Random Forest")]:
+            m = results[name]
+            with col:
+                st.subheader(name)
+                x1,x2,x3 = st.columns(3)
+                x1.metric("Accuracy", f"{m['accuracy']:.3f}")
+                x2.metric("Precision", f"{m['precision']:.3f}")
+                x3.metric("Recall", f"{m['recall']:.3f}")
+                st.metric("F1-score (weighted)", f"{m['f1']:.3f}")
+                cm = m["confusion_matrix"]
+                fig = px.imshow(cm, text_auto=True, aspect="auto", x=m["labels"], y=m["labels"],
+                                labels=dict(x="Predicted",y="Actual",color="Count"), title="Confusion matrix")
+                st.plotly_chart(fig, use_container_width=True)
+        st.subheader("Random Forest feature importance")
+        imp = results["Random Forest"]["importance"]
+        fig = px.bar(imp.sort_values("importance"), x="importance", y="feature", orientation="h",
+                     title="Relative feature importance")
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Evaluation uses a stratified hold-out test set. Metrics describe performance on this synthetic demonstration dataset; they are not evidence of real-world school performance.")
 
-elif menu == "Data Analysis":
-    st.header("Exploratory Data Analysis")
-    if df.empty: st.warning("No data is available to analyze.")
+elif page == "Student Clustering":
+    header("Student Segmentation with K-Means", "Group students with similar academic characteristics for exploratory analysis.")
+    k = st.slider("Number of clusters (K)", min_value=2, max_value=6, value=3)
+    cluster_result = run_student_clustering(filtered, k=k)
+    if "error" in cluster_result:
+        st.error(cluster_result["error"])
     else:
-        st.subheader("Descriptive statistics")
-        st.dataframe(df.describe(include="all").transpose(), use_container_width=True)
-        charts = [
-            ("Request volume by service type", service_volume_chart(df)),
-            ("Observed target distribution", target_chart(df)),
-            ("Observed breach rate by office", office_breach_chart(df)),
-            ("Observed breach rate by queue category", queue_chart(df)),
-        ]
-        available = [(name, fig) for name,fig in charts if fig is not None]
-        if available:
-            chosen = st.multiselect("Choose charts", [name for name,_ in available], default=[name for name,_ in available[:3]])
-            for name,fig in available:
-                if name in chosen: st.plotly_chart(fig, use_container_width=True)
-        labeled = df["SLA_Breached"].dropna() if "SLA_Breached" in df else pd.Series(dtype=float)
-        if len(labeled):
-            st.info(f"Observed SLA breach rate among labeled records: {labeled.mean()*100:.1f}% ({int(labeled.sum())} breaches out of {len(labeled)} labeled records). This is a historical outcome, not a prediction for pending requests.")
-        else: st.info("No labeled SLA outcomes are available; target-based charts are omitted.")
+        clustered = cluster_result["data"]
+        c1,c2 = st.columns(2)
+        with c1:
+            st.metric("Silhouette score", f"{cluster_result['silhouette']:.3f}")
+            st.caption("Closer to 1 generally indicates more separated clusters; values near 0 indicate overlap.")
+        with c2:
+            st.metric("Clusters", k)
+            st.caption("K-Means uses scaled prior-period academic variables.")
+        fig = px.scatter(clustered, x="prior_general_average", y="prior_attendance_rate", color="cluster",
+                         hover_data=["student_code","year_level","section"], title="Student clusters",
+                         labels={"prior_general_average":"Prior general average","prior_attendance_rate":"Prior attendance (%)","cluster":"Cluster"})
+        st.plotly_chart(fig, use_container_width=True)
+        profile = clustered.groupby("cluster").agg(Students=("student_code","count"), Prior_Average=("prior_general_average","mean"),
+                    Prior_Attendance=("prior_attendance_rate","mean"), Prior_Failed=("prior_failed_subjects","mean")).round(2)
+        st.subheader("Cluster profiles")
+        st.dataframe(profile, use_container_width=True)
+        st.caption("Cluster numbers are arbitrary labels. Interpret each group using its profile, not the cluster number alone.")
 
-elif menu == "Prediction":
-    st.header("Predictive Modeling")
-    st.write("Inputs follow the exact ten submission-time predictors in the midterm notebook. Outcome fields such as Processing_Days, Status, Reopened, and Satisfaction_Score are intentionally excluded.")
-    try:
-        model = load_model()
-        st.success("Original fitted model artifact loaded.")
-    except Exception as exc:
-        model = None
-        st.error(str(exc))
-    # Categories are inferred from the supplied dataset; model's OneHotEncoder ignores unseen categories.
-    def options(col, fallback):
-        if col in df.columns:
-            vals = sorted(df[col].dropna().astype(str).unique().tolist())
-            if vals: return vals
-        return fallback
-    with st.form("prediction_form"):
-        a,b = st.columns(2)
-        with a:
-            service = st.selectbox("Service type", options("Service_Type", ["Records"]))
-            requester = st.selectbox("Requester type", options("Requester_Type", ["Student"]))
-            channel = st.selectbox("Requested channel", options("Requested_Channel", ["Portal"]))
-            priority = st.selectbox("Priority", options("Priority", ["Normal"]))
-            office = st.selectbox("Assigned office", options("Assigned_Office", ["Student Affairs"]))
-        with b:
-            queue_length = st.number_input("Queue length at submission", min_value=0, max_value=100000, value=5, step=1)
-            queue_category = st.selectbox("Queue category", ["Low","Medium","High"], index=0)
-            docs = st.selectbox("Required documents complete", options("Required_Documents_Complete", ["Yes","No"]))
-            sla_days = st.number_input("SLA days", min_value=0.0, max_value=3650.0, value=5.0, step=1.0)
-            weekday = st.selectbox("Submission weekday", ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"])
-        submitted = st.form_submit_button("Predict SLA breach risk", disabled=model is None)
-    if submitted and model is not None:
-        try:
-            result = predict_one(model, {"Service_Type":service,"Requester_Type":requester,"Requested_Channel":channel,
-                "Priority":priority,"Assigned_Office":office,"Queue_Length":queue_length,"Queue_Category":queue_category,
-                "Required_Documents_Complete":docs,"SLA_Days":sla_days,"Submission_Weekday":weekday})
-            st.subheader(result["prediction_label"])
-            if "breach_probability" in result: st.metric("Model-estimated breach probability", f"{result['breach_probability']*100:.1f}%")
-            st.caption(f"Prediction timestamp (UTC): {result['timestamp_utc']} · Model version: {result['model_version']}")
-            st.warning("This is a model estimate, not a confirmed breach or guarantee. Check document completeness, workload, and current case details before acting.")
-        except Exception as exc: st.error(f"Prediction failed: {exc}")
-    st.subheader("Five fictional sample cases")
-    sample_cases = [
-        dict(Service_Type="Records",Requester_Type="Student",Requested_Channel="Portal",Priority="Normal",Assigned_Office="Student Affairs",Queue_Length=4,Queue_Category="Low",Required_Documents_Complete="Yes",SLA_Days=5,Submission_Weekday="Monday"),
-        dict(Service_Type="Scholarship",Requester_Type="Student",Requested_Channel="Walk-in",Priority="High",Assigned_Office="Scholarship Office",Queue_Length=18,Queue_Category="High",Required_Documents_Complete="No",SLA_Days=3,Submission_Weekday="Tuesday"),
-        dict(Service_Type="Enrollment",Requester_Type="Student",Requested_Channel="Portal",Priority="Normal",Assigned_Office="Registrar",Queue_Length=9,Queue_Category="Medium",Required_Documents_Complete="Yes",SLA_Days=5,Submission_Weekday="Wednesday"),
-        dict(Service_Type="ID",Requester_Type="Student",Requested_Channel="Email",Priority="Low",Assigned_Office="Student Affairs",Queue_Length=2,Queue_Category="Low",Required_Documents_Complete="Yes",SLA_Days=7,Submission_Weekday="Thursday"),
-        dict(Service_Type="Scholarship",Requester_Type="Student",Requested_Channel="Portal",Priority="High",Assigned_Office="Scholarship Office",Queue_Length=12,Queue_Category="Medium",Required_Documents_Complete="No",SLA_Days=3,Submission_Weekday="Friday"),
-    ]
-    samples = pd.DataFrame(sample_cases, index=[f"Fictional case {i}" for i in range(1,6)])
-    st.dataframe(samples, use_container_width=True)
-    if model is not None:
-        results=[]
-        for i,case in enumerate(sample_cases,1):
-            try:
-                r=predict_one(model,case); results.append({"Case":i,"Prediction":r["prediction_label"],"Breach probability":r.get("breach_probability"),"Timestamp UTC":r["timestamp_utc"]})
-            except Exception as e: results.append({"Case":i,"Prediction":f"Error: {e}"})
-        st.dataframe(pd.DataFrame(results), use_container_width=True)
-    else:
-        st.info("Predictions for these five cases are intentionally not fabricated. Add the original fitted pipeline to models/trained_model.joblib to generate them.")
+elif page == "Reports":
+    header("Reports & Data Export", "Download filtered student records and a concise PDF summary.")
+    export = filtered.copy()
+    export["recommended_action"] = export.apply(make_recommendation, axis=1)
+    st.metric("Records included in report", len(export))
+    st.download_button("⬇ Download filtered CSV", export.to_csv(index=False).encode("utf-8"), "student_performance_filtered_report.csv", "text/csv", use_container_width=True)
+    pdf = build_pdf_report(export)
+    st.download_button("⬇ Download PDF summary", pdf, "student_performance_summary.pdf", "application/pdf", use_container_width=True)
+    st.dataframe(export.head(20), use_container_width=True, hide_index=True)
 
-elif menu == "Dashboard":
-    st.header("Decision-Support Dashboard")
-    if df.empty: st.warning("No data is available.")
-    else:
-        k = dashboard_kpis(df)
-        a,b,c,d = st.columns(4)
-        a.metric("Total requests", f"{k['total_requests']:,}")
-        b.metric("Completed requests", k["completed_requests"] if k["completed_requests"] is not None else "N/A")
-        c.metric("Labeled outcomes", k["labeled_requests"])
-        d.metric("Observed SLA breach rate", f"{k['observed_breach_rate_percent']:.1f}%" if k["observed_breach_rate_percent"] is not None else "N/A")
-        st.caption("Observed breach metrics use completed/labeled records. Predicted breaches are not counted until a fitted model is available.")
-        if "Status" in df.columns:
-            st.subheader("Request status")
-            st.plotly_chart(px.histogram(df, x="Status", title="Request volume by status"), use_container_width=True)
-        if "Queue_Category" in df.columns:
-            st.subheader("Queue workload")
-            st.plotly_chart(px.histogram(df, x="Queue_Category", title="Requests by queue category"), use_container_width=True)
-        st.subheader("Review queue")
-        q = review_queue(df)
-        if q.empty: st.info("No review queue fields are available.")
-        else:
-            st.dataframe(q, use_container_width=True)
-            st.caption("Historical labels are clearly marked as observed outcomes. They must not be interpreted as predictions for pending requests.")
-        st.subheader("Suggested human follow-up")
-        st.markdown("- Verify required documents and the request's current status.\n- Check workload and the applicable SLA.\n- Contact the responsible office if the queue is unusually high.\n- Record the staff decision in the authorized operational system; this prototype does not persist review decisions.")
-
-else:
-    st.header("System Design")
-    st.subheader("A. Functional requirements")
-    requirements = [
-        ("FR-01","The system shall accept CSV uploads and report missing required columns, missing values, duplicate rows, duplicate Request_ID values, and numeric parsing issues."),
-        ("FR-02","The system shall show descriptive statistics and interactive charts for service volume, labeled target distribution, office breach rates, and queue-category breach rates when the needed columns exist."),
-        ("FR-03","The system shall accept the ten submission-time features and call the saved fitted pipeline to predict SLA breach risk when the original model artifact is available."),
-        ("FR-04","The system shall display request-volume, status, workload, labeled-outcome KPIs, and a review queue while distinguishing observed outcomes from predicted risks."),
-        ("FR-05","The system shall present risk as advisory and provide human follow-up guidance without automatically denying or approving a service request.")
-    ]
-    st.table(pd.DataFrame(requirements,columns=["ID","Requirement"]))
-    st.subheader("B. Non-functional requirements (proposed; stakeholder approval needed)")
-    st.table(pd.DataFrame([
-        ("NFR-01 Privacy/security","Proposed: mask Request_ID values in preview by default; public deployment must use synthetic or explicitly authorized data. Authentication/role-based access is not implemented."),
-        ("NFR-02 Performance","Proposed: on a standard laptop, load the 400-row sample dataset and render the main dashboard within 3 seconds after the app is warm; verify on target hosting."),
-        ("NFR-03 Reliability/usability","Proposed: invalid CSVs and missing model files show actionable errors instead of crashing; all six navigation pages remain accessible.")
-    ],columns=["ID","Requirement"]))
-    st.subheader("C. Actors and access")
-    st.markdown("- **Student Service Staff / Service Officer:** review request details and advisory flags. Authentication is not implemented.\n- **Office Supervisor:** review office-level queue and SLA patterns; proposed role, pending stakeholder confirmation.\n- **System Administrator:** maintain deployment and approved model/data artifacts. This prototype does not implement account management.\n- **Student/requester:** submits requests in the wider service system; request submission is outside this monitoring prototype.")
-    st.subheader("D. UML use case diagram")
-    img = BASE / "assets" / "use_case_diagram.png"
-    if img.exists(): st.image(str(img), caption="Use case diagram (editable Graphviz source: assets/use_case_diagram.dot)", use_container_width=True)
-    st.subheader("E. Analytical process flow")
-    st.code("Request Dataset → Data Validation → Preprocessing → Saved Predictive Model → SLA Breach Prediction → Dashboard and Review Queue → Authorized Staff Review → Human Decision and Follow-Up", language="text")
-    st.markdown("The prediction step is available only when the supplied fitted model artifact passes schema checks. Human review and final decisions remain outside the model.")
+st.markdown("---")
+st.markdown('<div class="small-note">Academic Insight Dashboard · Demonstration version · Synthetic data only · Human review is required before any student-support action.</div>', unsafe_allow_html=True)
